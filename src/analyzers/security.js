@@ -2,6 +2,7 @@ import axios from 'axios';
 import { CronJob } from 'cron';
 import logger from '../utils/logger.js';
 import { query } from '../utils/database.js';
+import { broadcasts } from '../websocket.js';
 
 class SecurityAnalyzer {
   constructor() {
@@ -236,9 +237,10 @@ class SecurityAnalyzer {
 
   async storeSecurityAlerts(skill, alerts) {
     for (const alert of alerts) {
-      await query(`
+      const result = await query(`
         INSERT INTO security_alerts (type, severity, title, description, metadata)
         VALUES ($1, $2, $3, $4, $5)
+        RETURNING *
       `, [
         alert.type,
         alert.severity,
@@ -250,6 +252,21 @@ class SecurityAnalyzer {
           ...alert
         })
       ]);
+
+      // Broadcast real-time security alert
+      if (result.rows[0]) {
+        broadcasts.securityAlert({
+          id: result.rows[0].id,
+          type: alert.type,
+          severity: alert.severity,
+          title: result.rows[0].title,
+          description: alert.description,
+          skill_name: skill.name,
+          created_at: result.rows[0].created_at
+        });
+
+        logger.info(`🚨 Real-time security alert broadcasted: ${alert.severity} - ${skill.name}`);
+      }
     }
   }
 
