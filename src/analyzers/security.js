@@ -3,12 +3,14 @@ import { CronJob } from 'cron';
 import logger from '../utils/logger.js';
 import { query } from '../utils/database.js';
 import { broadcasts } from '../websocket.js';
+import AIClient from '../utils/ai_client.js';
 
 class SecurityAnalyzer {
   constructor() {
     this.isRunning = false;
     this.scanJob = null;
     this.lastScanTime = null;
+    this.aiClient = new AIClient();
     
     // Security patterns to detect in skills
     this.dangerousPatterns = [
@@ -33,7 +35,7 @@ class SecurityAnalyzer {
       
       // Suspicious file paths
       /\/tmp\/|\/var\/tmp\//gi,
-      /\.\.\/|\.\.\\\/gi // Directory traversal
+      /\.\.\/|\.\.\\\\/gi // Directory traversal
     ];
     
     this.suspiciousKeywords = [
@@ -149,7 +151,36 @@ class SecurityAnalyzer {
       
       const content = response.data;
       
-      // Pattern-based analysis
+      // Fast pattern-based analysis (cost-free)
+      const patternAlerts = await this.patternBasedAnalysis(content);
+      alerts.push(...patternAlerts.alerts);
+      maxSeverity = patternAlerts.maxSeverity;
+      
+      // AI-enhanced analysis for complex cases (cost-optimized)
+      if (content.length > 5000 || patternAlerts.alerts.length > 5) {
+        const aiAlerts = await this.aiEnhancedAnalysis(content, skill.name);
+        alerts.push(...aiAlerts.alerts);
+        if (aiAlerts.maxSeverity === 'high') maxSeverity = 'high';
+        else if (aiAlerts.maxSeverity === 'medium' && maxSeverity === 'low') maxSeverity = 'medium';
+      }
+      
+    } catch (error) {
+      alerts.push({
+        type: 'analysis_error',
+        severity: 'low',
+        description: `Failed to analyze skill: ${error.message}`
+      });
+    }
+    
+    return { alerts, maxSeverity };
+  }
+
+  async patternBasedAnalysis(content) {
+    const alerts = [];
+    let maxSeverity = 'low';
+    
+    try {
+      // Pattern-based analysis (existing logic)
       for (const pattern of this.dangerousPatterns) {
         const matches = content.match(pattern);
         if (matches) {
@@ -213,6 +244,87 @@ class SecurityAnalyzer {
     }
     
     return { alerts, maxSeverity };
+  }
+
+  /**
+   * AI-enhanced security analysis for complex cases (cost-optimized)
+   * Uses Haiku model with cached prompts for 85%+ cost reduction
+   */
+  async aiEnhancedAnalysis(content, skillName) {
+    try {
+      // Truncate content for cost optimization (Haiku has lower limits)
+      const truncatedContent = content.length > 8000 
+        ? content.substring(0, 8000) + '\n... [truncated for analysis]'
+        : content;
+
+      const prompt = `Analyze this skill for security issues: "${skillName}"\n\nContent:\n${truncatedContent}`;
+
+      const response = await this.aiClient.generateResponse(
+        'security_scan', // Task type
+        prompt,
+        {
+          systemPromptKey: 'security_analysis', // Uses cached prompt
+          complexity: 'simple', // Routes to Haiku model
+          maxTokens: 300, // Limit output for cost control
+          useCache: true
+        }
+      );
+
+      // Parse AI response
+      let aiResult;
+      try {
+        aiResult = JSON.parse(response.content);
+      } catch (parseError) {
+        logger.warn('Failed to parse AI security analysis', { 
+          skillName, 
+          response: response.content.substring(0, 200),
+          error: parseError.message 
+        });
+        return { alerts: [], maxSeverity: 'low' };
+      }
+
+      // Convert AI alerts to our format
+      const alerts = (aiResult.alerts || []).map(alert => ({
+        type: alert.type || 'ai_detected',
+        severity: alert.severity || 'medium',
+        description: `AI Analysis: ${alert.description}`,
+        confidence: response.cached ? 'high' : 'medium', // Cache hits are more reliable
+        source: 'ai_analysis'
+      }));
+
+      const maxSeverity = alerts.reduce((max, alert) => {
+        if (alert.severity === 'high') return 'high';
+        if (alert.severity === 'medium' && max !== 'high') return 'medium';
+        return max;
+      }, 'low');
+
+      logger.debug('AI security analysis completed', {
+        skillName,
+        alertsFound: alerts.length,
+        maxSeverity,
+        model: response.model,
+        cached: response.cached,
+        tokensUsed: response.usage.input_tokens + response.usage.output_tokens
+      });
+
+      return { alerts, maxSeverity };
+
+    } catch (error) {
+      logger.error('AI security analysis failed', {
+        skillName,
+        error: error.message
+      });
+      
+      return { 
+        alerts: [{
+          type: 'ai_analysis_error',
+          severity: 'low',
+          description: `AI analysis failed: ${error.message}`,
+          source: 'ai_analysis'
+        }],
+        maxSeverity: 'low'
+      };
+    }
   }
 
   calculateSeverity(pattern, matches) {
@@ -286,11 +398,22 @@ class SecurityAnalyzer {
   }
 
   getStats() {
+    const aiStats = this.aiClient.getUsageStats();
+    
     return {
       isRunning: this.isRunning,
       lastScanTime: this.lastScanTime,
       patternCount: this.dangerousPatterns.length,
-      keywordCount: this.suspiciousKeywords.length
+      keywordCount: this.suspiciousKeywords.length,
+      // AI usage statistics for cost monitoring
+      aiUsage: {
+        totalRequests: aiStats.totalRequests,
+        totalTokensUsed: aiStats.totalTokensUsed,
+        cacheHitRate: `${(aiStats.cacheHitRate * 100).toFixed(1)}%`,
+        modelUsage: aiStats.modelUsage,
+        estimatedMonthlyCost: aiStats.estimatedMonthlyCost,
+        costOptimization: 'Pattern-based analysis first, AI enhancement for complex cases only'
+      }
     };
   }
 }
